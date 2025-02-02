@@ -11,6 +11,8 @@ import numpy as np
 
 import time
 import torch.multiprocessing as mp
+import os
+
 
 # Set start method at the beginning
 mp.set_start_method('spawn', force=True)
@@ -55,6 +57,7 @@ def initialize_worker_models(config, checkpoint_path, gpu_id):
     return unet, scheduler, vae
 
 
+
 def initialize_workers(
     worker_config: dict,  # Format: {"denoise": {0: 2, 1: 1}, "restore": {0: 1, 1: 2}}
     config,
@@ -62,6 +65,8 @@ def initialize_workers(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
     final_queue: mp.Queue,
+    shared_tensor_queues,
+    restore_tensor_queues
 ):
     workers = []
     
@@ -80,7 +85,7 @@ def initialize_workers(
                 # Start denoise worker
                 denoise_p = mp.Process(
                     target=denoise_worker,
-                    args=(gpu_id, input_queue, output_queue, unet, scheduler, vae)
+                    args=(gpu_id, input_queue, output_queue, unet, scheduler, vae, config, shared_tensor_queues[gpu_id])
                 )
                 print(f"############## Finish starting denoise worker {worker_idx} on GPU {gpu_id} ####################")
                 denoise_p.start()
@@ -93,7 +98,7 @@ def initialize_workers(
                 # Start restore worker
                 restore_p = mp.Process(
                     target=restore_video_worker,
-                    args=(output_queue, final_queue, config, gpu_id)
+                    args=(output_queue, final_queue, config, gpu_id, worker_idx, restore_tensor_queues[gpu_id])
                 )
                 print(f"############## Finish starting restore worker {worker_idx} on GPU {gpu_id} ####################")
                 restore_p.start()
@@ -101,6 +106,42 @@ def initialize_workers(
 
     return workers
 
+
+def prepare_image_latents(images, device, dtype, generator, do_classifier_free_guidance, vae):
+    # vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    images = images.to(device=device, dtype=dtype)
+    image_latents = vae.encode(images).latent_dist.sample(generator=generator)
+    image_latents = (image_latents - vae.config.shift_factor) * vae.config.scaling_factor
+    image_latents = rearrange(image_latents, "f c h w -> 1 c f h w")
+    image_latents = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
+    return image_latents
+
+def prepare_mask_latents(
+    mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance, vae
+):
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    mask = torch.nn.functional.interpolate(
+        mask, size=(height // vae_scale_factor, width // vae_scale_factor)
+    )
+    masked_image = masked_image.to(device=device, dtype=dtype)
+
+    # encode the mask image into latents space so we can concatenate it to the latents
+    masked_image_latents = vae.encode(masked_image).latent_dist.sample(generator=generator)
+    masked_image_latents = (masked_image_latents - vae.config.shift_factor) * vae.config.scaling_factor
+
+    # aligning device to prevent device errors when concating it with the latent model input
+    masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
+    mask = mask.to(device=device, dtype=dtype)
+
+    # assume batch size = 1
+    mask = rearrange(mask, "f c h w -> 1 c f h w")
+    masked_image_latents = rearrange(masked_image_latents, "f c h w -> 1 c f h w")
+
+    mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+    masked_image_latents = (
+        torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
+    )
+    return mask, masked_image_latents
 
 @torch.no_grad()
 def decode_latents( latents, vae):
@@ -128,89 +169,133 @@ def restore_video(faces, video_frames, boxes, affine_matrices, image_processor):
        out_frame = image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
        out_frames.append(out_frame)
    return np.stack(out_frames, axis=0)
-    
-@torch.no_grad()
-def restore_video_worker(input_queue: mp.Queue, output_queue: mp.Queue, config, gpu_id):
-
-   # Initialize Image Processor
-   image_processor = ImageProcessor(config.data.resolution, mask="fix_mask", device=f"cuda:{gpu_id}")
-   while True:
-       try:
-           batch_data = input_queue.get()
-           if batch_data is None:
-               break
-
-           
-           start_time = time.time()
-           batch_id, decoded_latents, video_frames, boxes, affine_matrices = batch_data
-           
-           # Since we're getting per-batch data, just use the indices directly
-           # No need to calculate start_idx and end_idx
-           restored = restore_video(
-               decoded_latents, 
-               video_frames[batch_id * len(decoded_latents):(batch_id + 1) * len(decoded_latents)],
-               boxes[batch_id * len(decoded_latents):(batch_id + 1) * len(decoded_latents)],
-               affine_matrices[batch_id * len(decoded_latents):(batch_id + 1) * len(decoded_latents)],
-               image_processor
-           )
-           
-           output_queue.put((batch_id, restored))
-
-           print(f"total restore worker : ", time.time() - start_time)
-       except Exception as e:
-           print(f"Error in restore worker: {str(e)}")
-           output_queue.put((None, e))
-           break
 
 
 @torch.no_grad()
-def denoise_worker(gpu_id: int, input_queue: mp.Queue, output_queue: mp.Queue, unet, scheduler, vae):
-# def denoise_worker(gpu_id: int, input_queue: mp.Queue, output_queue: mp.Queue, unet, scheduler, pipeline):
-
-    # Set up device
-    device = torch.device(f"cuda:{gpu_id}")
-    unet = unet.to(device)
-    
+def restore_video_worker(input_queue: mp.Queue, output_queue: mp.Queue, config, gpu_id, worker_id, restore_tensor_queue):
+    restore_tensors = restore_tensor_queue.get()  
+    restore_original_frames, restore_boxes, restore_affine = restore_tensors
+    print("############ GET SHARED RESTORE TENSOR #############")
+    # Initialize Image Processor
+    image_processor = ImageProcessor(config.data.resolution, mask="fix_mask", device=f"cuda:{gpu_id}")
     while True:
         try:
+            q_fetch = time.time()
+            batch_data = input_queue.get()
+            if batch_data is None:
+                break
+            print(f"restore worker fetch {worker_id}: ", time.time() - q_fetch)
+            
+            start_time = time.time()
+            batch_id, decoded_latents, start_idx, end_idx = batch_data
+        
+            restored = restore_video(
+                decoded_latents, 
+                restore_original_frames[start_idx:end_idx] ,
+                restore_boxes[start_idx:end_idx] if restore_boxes is not None else None,
+                restore_affine[start_idx:end_idx] if restore_affine is not None else None,
+                image_processor
+            )
+            
+            output_queue.put((batch_id, restored))
+            print(f"XXX total restore worker {worker_id}: ", time.time() - start_time)
+        except Exception as e:
+            print(f"Error in restore worker: {str(e)}")
+            output_queue.put((None, e))
+            break
+
+
+
+
+@torch.no_grad()
+def denoise_worker(gpu_id: int, input_queue: mp.Queue, output_queue: mp.Queue, 
+                  unet, scheduler, vae, config, shared_tensor_queue):
+  
+
+    shared_tensors = shared_tensor_queue.get()  
+    shared_video_frames, shared_latents, shared_original_frames, shared_boxes, shared_affine = shared_tensors
+    print("############ GET SHARED TENSOR #############")
+    
+    device = torch.device(f"cuda:{gpu_id}")
+    unet = unet.to(device)
+    image_processor = ImageProcessor(config.data.resolution, mask="fix_mask", device=f"cuda:{gpu_id}")
+    while True:
+        try:
+            current_size = input_queue.qsize()
+            
+            q_fetch = time.time()
             # Get next batch from queue
             batch_data = input_queue.get()
             
             # Check for termination signal
             if batch_data is None:
                 break
-
+            print(f"denoise worker fetch: ", time.time() - q_fetch)
 
             start_time = time.time()
+        
+            (batch_id, start_idx, end_idx, whisper_chunks, height, width,
+             generator, do_classifier_free_guidance, guidance_scale, 
+             extra_step_kwargs, num_inference_steps, weight_dtype) = batch_data
+
+            video_frames = shared_video_frames[start_idx:end_idx]
+            all_latents = shared_latents[:, :, start_idx:end_idx]
+            original_video_frames = shared_original_frames[start_idx:end_idx]  
+            boxes = shared_boxes[start_idx:end_idx] if shared_boxes is not None else None  
+            affine_matrices = shared_affine[start_idx:end_idx] if shared_affine is not None else None  
             
-            # Unpack batch data
-            (batch_id, latents, timesteps_t, mask_latents, masked_image_latents, 
-             image_latents, audio_embeds, do_classifier_free_guidance, 
-             guidance_scale, extra_step_kwargs, num_inference_steps, 
-             pixel_values, masks, weight_dtype, original_video_frames, boxes, affine_matrices) = batch_data
+
+            # Audio embedding preprocessing
+            if unet.add_audio_layer:
+                audio_embeds = torch.stack(whisper_chunks)
+                audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
+                if do_classifier_free_guidance:
+                    empty_audio_embeds = torch.zeros_like(audio_embeds)
+                    audio_embeds = torch.cat([empty_audio_embeds, audio_embeds])
+            else:
+                audio_embeds = None
+
+            # Get latents for this batch
+            latents = all_latents.to(device)
+            
+            # Prepare masks and images
+            pixel_values, masked_pixel_values, masks = image_processor.prepare_masks_and_masked_images(
+                video_frames, affine_transform=False
+            )
+
+            # Prepare mask latents
+            mask_latents, masked_image_latents = prepare_mask_latents(
+                masks,
+                masked_pixel_values,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance,
+                vae,
+            )
+
+            # Prepare image latents
+            image_latents = prepare_image_latents(
+                pixel_values,
+                device,
+                weight_dtype,
+                generator,
+                do_classifier_free_guidance,
+                vae,
+            )
+
+            preprocess_time = time.time()
 
             # Set timesteps here
             scheduler.set_timesteps(num_inference_steps, device=device)
             timesteps = scheduler.timesteps
             
-            # Move everything to GPU
-            latents = latents.to(device)
-            timesteps = timesteps.to(device)
-            mask_latents = mask_latents.to(device)
-            masked_image_latents = masked_image_latents.to(device)
-            image_latents = image_latents.to(device)
-            if audio_embeds is not None:
-                audio_embeds = audio_embeds.to(device)
-            
             # Process the batch
             num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
-
-            fetch_move_time = time.time()
-            # print(f"fetch move time {batch_id}: ", fetch_move_time - start_time )
             
             for j, t in enumerate(timesteps):
-                
-                
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
                 # concat latents, mask, masked_image_latents in the channel dimension
@@ -222,7 +307,6 @@ def denoise_worker(gpu_id: int, input_queue: mp.Queue, output_queue: mp.Queue, u
                 # predict the noise residual
                 noise_pred = unet(latent_model_input, t, encoder_hidden_states=audio_embeds).sample
 
-
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
@@ -231,28 +315,17 @@ def denoise_worker(gpu_id: int, input_queue: mp.Queue, output_queue: mp.Queue, u
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-
-
-            denoise_time = time.time()
-            # print(f"denoise loop time {batch_id}: ", denoise_time - fetch_move_time )
-            
+            denoise_time = time.time()            
             decoded_latents = decode_latents(latents, vae)
             decoded_latents = paste_surrounding_pixels_back(
                 decoded_latents, pixel_values, 1 - masks, device, weight_dtype
             )
         
             paste_time = time.time()
-            # print(f"paste back time {batch_id}: ", paste_time - denoise_time )
-
-
-            # result = (batch_id, decoded_latents.cpu(), original_video_frames, boxes, affine_matrices)
-            result = (batch_id, decoded_latents, original_video_frames, boxes, affine_matrices)
+            result = (batch_id, decoded_latents, start_idx, end_idx) 
             output_queue.put(result)
 
-
-            putback_time = time.time()
-
-            print(f"total denoise worker {batch_id}: ", time.time() - start_time)
+            print(f" ### total denoise worker {batch_id}: ", time.time() - start_time)
      
         except Exception as e:
             print(f"Error in worker on GPU {gpu_id}: {str(e)}")
@@ -260,34 +333,56 @@ def denoise_worker(gpu_id: int, input_queue: mp.Queue, output_queue: mp.Queue, u
             break
 
 
+def cleanup_workers(workers, worker_config, input_queue, output_queue, final_queue, shared_tensor_queues, restore_tensor_queues):
+    n_denoise = sum(worker_config["denoise"].values())  
+    n_restore = sum(worker_config["restore"].values())
+    
+    print(f"Force terminating {n_denoise} denoise workers and {n_restore} restore workers")
+    
+    # Force terminate all processes
+    for p in workers:
+        if p.is_alive():
+            p.terminate()  # Force kill
+            p.join(timeout=1)  
+            if p.is_alive():  
+                os.kill(p.pid, signal.SIGKILL)  # Force kill with SIGKILL
+        print("----- Terminate Worker ------")
+    
+    # Force close all queues
+    try:
+        input_queue.close()
+        input_queue.cancel_join_thread()
+    except:
+        pass
+        
+    try:
+        output_queue.close()
+        output_queue.cancel_join_thread()
+    except:
+        pass
+        
+    try:
+        final_queue.close()
+        final_queue.cancel_join_thread()
+    except:
+        pass
+        
+    for gpu_id in shared_tensor_queues:
+        try:
+            shared_tensor_queues[gpu_id].close()
+            shared_tensor_queues[gpu_id].cancel_join_thread()
+        except:
+            pass
 
-def cleanup_workers(workers, worker_config, input_queue, output_queue, final_queue):
-   
-   n_denoise = sum(worker_config["denoise"].values())  
-   n_restore = sum(worker_config["restore"].values())
-   
-   print(f"Terminating {n_denoise} denoise workers and {n_restore} restore workers")
-   
-   # Send termination to denoise workers
-   for _ in range(n_denoise):
-       input_queue.put(None)
-   
-   # Send termination to restore workers 
-   for _ in range(n_restore):
-       output_queue.put(None)
-   
-   # Wait for all workers to finish and terminate
-   for p in workers:
-       p.join()
-       p.terminate()
-       print("----- Terminate Worker ------")
-   
-   # Close all queues
-   input_queue.close() 
-   output_queue.close()
-   final_queue.close()
-   
-   torch.cuda.empty_cache()
+    for gpu_id in restore_tensor_queues:
+        try:
+            restore_tensor_queues[gpu_id].close()
+            restore_tensor_queues[gpu_id].cancel_join_thread()
+        except:
+            pass
+    
+    torch.cuda.empty_cache()
+    print("Cleanup complete")
     
 def launch_workers(num_gpus, unet, scheduler):
     """

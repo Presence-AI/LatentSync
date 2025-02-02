@@ -75,6 +75,8 @@ def main(config, args):
         audio_path=args.audio_path,
         video_out_path=args.video_out_path,
         video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
+        # num_frames=config.data.num_frames,
+        # num_inference_steps=config.run.inference_steps,
         guidance_scale=args.guidance_scale,
         weight_dtype=torch.float16,
         width=config.data.resolution,
@@ -96,3 +98,4 @@ if __name__ == "__main__":
     config = OmegaConf.load(args.unet_config_path)
 
     main(config, args)
+

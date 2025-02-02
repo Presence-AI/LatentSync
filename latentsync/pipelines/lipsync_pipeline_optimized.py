@@ -135,32 +135,47 @@ class LipsyncPipeline(DiffusionPipeline):
         checkpoint_path = os.path.join(root_dir, "checkpoints/latentsync_unet.pt")
         config = OmegaConf.load(os.path.join(root_dir, "configs/unet/second_stage.yaml"))
 
+   
+        # for 2 GPU
+        # self.worker_config = {
+        #     "denoise": {
+        #         0: 1,  
+        #         1: 1  
+        #     },
+        #     "restore": {
+        #         0: 3,  
+        #         1: 3   
+        #     }
+        # }
 
-
-        self.input_queue = mp.Queue()
-        self.output_queue = mp.Queue()  
-        self.final_queue = mp.Queue()
-        
         self.worker_config = {
             "denoise": {
-                0: 2,  
-                1: 2  
+                0: 1,  
+                1: 0  
             },
             "restore": {
-                0: 2,  
-                1: 2   
+                0: 4,  
+                1: 0   
             }
         }
 
-        # Initialize workers
+        self.input_queue = mp.Queue()
+        self.output_queue = mp.Queue()
+        self.final_queue = mp.Queue()
+        self.shared_tensor_queues = {gpu_id: mp.Queue() for gpu_id in self.worker_config["denoise"].keys()}
+        self.restore_tensor_queues = {gpu_id: mp.Queue() for gpu_id in self.worker_config["restore"].keys()}
+
+        
         self.workers = initialize_workers(
             worker_config=self.worker_config,
             config=config,
             checkpoint_path=checkpoint_path,
             input_queue=self.input_queue,
             output_queue=self.output_queue,
-            final_queue=self.final_queue
-        )
+            final_queue=self.final_queue,
+            shared_tensor_queues=self.shared_tensor_queues,
+            restore_tensor_queues= self.restore_tensor_queues)
+        
 
 
 
@@ -345,12 +360,10 @@ class LipsyncPipeline(DiffusionPipeline):
         video_out_path: str,
         video_mask_path: str = None,
         num_frames: int = 10,
-        # num_frames: int = 16,
         video_fps: int = 25,
         audio_sample_rate: int = 16000,
         height: Optional[int] = None,
         width: Optional[int] = None,
-        # num_inference_steps: int = 20,
         num_inference_steps: int = 5,
         guidance_scale: float = 1.5,
         weight_dtype: Optional[torch.dtype] = torch.float16,
@@ -361,6 +374,8 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         **kwargs,
     ):
+
+     
         is_train = self.unet.training
         self.unet.eval()
 
@@ -422,81 +437,93 @@ class LipsyncPipeline(DiffusionPipeline):
             generator,
         )
 
-        start_time = time.time()
-        sub_time = 0
+      
 
-        for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
-            time_audio = time.time()
-            
-            if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
-                audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
-                if do_classifier_free_guidance:
-                    empty_audio_embeds = torch.zeros_like(audio_embeds)
-                    audio_embeds = torch.cat([empty_audio_embeds, audio_embeds])
-            else:
-                audio_embeds = None
+        gpu_data = {
+            gpu_id: (
+                video_frames,
+                all_latents,
+                original_video_frames,
+                boxes,
+                affine_matrices
+            ) for gpu_id in self.worker_config["denoise"].keys()
+        }
+
+        gpu_data_restore = {
+            gpu_id: (
+                original_video_frames,
+                boxes,
+                affine_matrices
+            ) for gpu_id in self.worker_config["restore"].keys()
+        }
+
+        # Send data to each denoise worker
+        for gpu_id in self.worker_config["denoise"].keys():
+            for _ in range(self.worker_config["denoise"][gpu_id]):  # Put 2 copies for each GPU
+                self.shared_tensor_queues[gpu_id].put(gpu_data[gpu_id])
+
+        # Send data to each restore worker
+        for gpu_id in self.worker_config["restore"].keys():
+            for _ in range(self.worker_config["restore"][gpu_id]):  # Put 3 copies for each GPU
+                self.restore_tensor_queues[gpu_id].put(gpu_data_restore[gpu_id])
+
+        time.sleep(40)
 
 
-            # print("audio time: ", time.time() - time_audio)
-            # time_img = time.time()
-
-            
-            inference_video_frames = video_frames[i * num_frames : (i + 1) * num_frames]
-            latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
-            pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
-                inference_video_frames, affine_transform=False
-            )
-
-            # 7. Prepare mask latent variables
-            mask_latents, masked_image_latents = self.prepare_mask_latents(
-                masks,
-                masked_pixel_values,
+        ######### warm up
+        # First, run warmup batches through the full pipeline
+        print("Starting warmup with 2 batches...")
+        for warmup_idx in range(2):  # Send first two batches as warmup
+            batch_data = (
+                warmup_idx,  # batch_id
+                warmup_idx * num_frames,  # start_idx
+                (warmup_idx + 1) * num_frames,  # end_idx
+                whisper_chunks[warmup_idx * num_frames : (warmup_idx + 1) * num_frames],
                 height,
                 width,
-                weight_dtype,
-                device,
                 generator,
-                do_classifier_free_guidance,
-            )
-
-            # 8. Prepare image latents
-            image_latents = self.prepare_image_latents(
-                pixel_values,
-                device,
-                weight_dtype,
-                generator,
-                do_classifier_free_guidance,
-            )
-
-            print("img_audio time: ", time.time() - time_audio)
-            sub_time += time.time() - time_audio
-
-            
-            # # 9. Denoising loop MODIFIED
-            time_denoise = time.time()
-            batch_data = (
-                i,
-                latents,
-                timesteps,
-                mask_latents,
-                masked_image_latents,
-                image_latents,
-                audio_embeds,
                 do_classifier_free_guidance,
                 guidance_scale,
                 extra_step_kwargs,
                 num_inference_steps,
-                pixel_values,
-                masks, 
                 weight_dtype,
-                original_video_frames,  
-                boxes,                  
-                affine_matrices       
+
+            )
+            self.input_queue.put(batch_data)
+            print(f"Added warmup batch {warmup_idx} to queue")
+
+        # Wait for warmup batches to be processed by emptying final queue
+        print("Waiting for warmup batches to complete...")
+        for _ in range(2):
+            _ = self.final_queue.get()  # This ensures both denoise and restore workers have processed the batch
+        print("Warmup completed")
+        #####################
+
+        start_time = time.time()
+        sub_time = 0
+        for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            time_audio = time.time()
+
+            
+            batch_data = (
+                i,  # batch_id
+                i * num_frames,  # start_idx for accessing shared memory
+                (i + 1) * num_frames,  # end_idx for accessing shared memory
+                whisper_chunks[i * num_frames : (i + 1) * num_frames],  # Pass whisper chunks directly
+                height,
+                width,
+                generator,
+                do_classifier_free_guidance,
+                guidance_scale,
+                extra_step_kwargs,
+                num_inference_steps,
+                weight_dtype
             )
 
             self.input_queue.put(batch_data)
-            masked_video_frames.append(masked_pixel_values)
+                
+            # masked_video_frames.append(masked_pixel_values)
+            print("Add batch to the queue: ", time.time()-start_time)
 
         # Initialize placeholder list for all batches
         restored_frames = [None] * num_inferences
@@ -512,16 +539,9 @@ class LipsyncPipeline(DiffusionPipeline):
             restored_frames[batch_id] = restored_batch
             completed_batches += 1
 
-        # Combine all frames
-        # synced_video_frames = np.concatenate(restored_frames, axis=0)
         print("Total time after recovering pixel: ", time.time() - start_time)
         print("Total time needed: ", time.time() - start_time - sub_time)
         synced_video_frames = np.concatenate(restored_frames, axis=0)
-        
-
-        masked_video_frames = self.restore_video(
-            torch.cat(masked_video_frames), original_video_frames, boxes, affine_matrices
-        )
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
@@ -544,4 +564,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # Terminate all process
         # cleanup_workers(self.workers, self.input_queue, self.output_queue)
-        cleanup_workers(self.workers,self.worker_config, self.input_queue, self.output_queue, self.final_queue)
+        # cleanup_workers(self.workers,self.worker_config, self.input_queue, self.output_queue, self.final_queue)
+        cleanup_workers(self.workers, self.worker_config, self.input_queue, 
+               self.output_queue, self.final_queue, self.shared_tensor_queues, self.restore_tensor_queues)
+
