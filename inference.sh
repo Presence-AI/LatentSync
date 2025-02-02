@@ -1,6 +1,6 @@
 #!/bin/bash
 
-python -m scripts.inference \
+python -m scripts.inference_optimized \
     --unet_config_path "configs/unet/second_stage.yaml" \
     --inference_ckpt_path "checkpoints/latentsync_unet.pt" \
     --inference_steps 20 \
