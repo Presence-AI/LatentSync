@@ -21,6 +21,7 @@ import numpy as np
 from typing import Union
 from .affine_transform import AlignRestore, laplacianSmooth
 import face_alignment
+import os
 
 """
 If you are enlarging the image, you should prefer to use INTER_LINEAR or INTER_CUBIC interpolation. If you are shrinking the image, you should prefer to use INTER_AREA interpolation.
