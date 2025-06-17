@@ -25,16 +25,28 @@ import torch.nn as nn
 import torchvision
 import torch.distributed as dist
 from torchvision import transforms
+from collections.abc import AsyncGenerator
+from concurrent.futures import ThreadPoolExecutor
 
 from einops import rearrange
 import cv2
-from decord import AudioReader, VideoReader
+from decord import AudioReader, VideoReader, gpu
 import shutil
 import subprocess
+import asyncio
+import logging
+
+logger = logging.getLogger("latentsync.utils")
 
 
 # Machine epsilon for a float32 (single precision)
 eps = np.finfo(np.float32).eps
+
+
+def normalize_video(input_path: str, output_path: str):
+    # Change FPS to 25 and ensure video dimensions are 1280x720
+    command = f"ffmpeg -loglevel error -y -nostdin -i {input_path} -vf scale=1280:720,fps=25 -crf 18 {output_path}"
+    subprocess.run(command, shell=True)
 
 
 def read_json(filepath: str):
@@ -49,9 +61,7 @@ def read_video(video_path: str, change_fps=True, use_decord=True):
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
-        command = (
-            f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
-        )
+        command = f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
         subprocess.run(command, shell=True)
         target_video_path = os.path.join(temp_dir, "video.mp4")
     else:
@@ -100,6 +110,42 @@ def read_video_cv2(video_path: str):
     return np.array(frames)
 
 
+async def read_video_decord_async(
+    video_path: str, batch_size: int, threadpool: ThreadPoolExecutor
+) -> AsyncGenerator[np.ndarray]:
+    """
+    Asynchronously reads video frames in batches using Decord.
+    """
+    loop = asyncio.get_event_loop()
+
+    # Initialize VideoReader
+    # TODO: add back GPU loading here with decord cuda install on latentsync
+    vr = VideoReader(video_path)
+
+    logger.info("Number of video frames: %s", len(vr))
+
+    i = 0
+    break_loop = False
+
+    def get_batch(vr, start, end):
+        batch = vr[slice(start, end)].asnumpy()
+        return batch
+
+    while True:
+        await asyncio.sleep(0)  # Yield control to the event loop
+        if i + batch_size >= len(vr):
+            break_loop = True
+            upper = len(vr)
+        else:
+            upper = i + batch_size
+
+        yield await loop.run_in_executor(threadpool, get_batch, vr, i, upper)
+        if break_loop:
+            break
+
+        i += batch_size
+
+
 def read_audio(audio_path: str, audio_sample_rate: int = 16000):
     if audio_path is None:
         raise ValueError("Audio path is required.")
@@ -127,7 +173,9 @@ def write_video(video_output_path: str, video_frames: np.ndarray, fps: int):
 
 def write_video_cv2(video_output_path: str, video_frames: np.ndarray, fps: int):
     height, width = video_frames[0].shape[:2]
-    out = cv2.VideoWriter(video_output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    out = cv2.VideoWriter(
+        video_output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+    )
     # out = cv2.VideoWriter(video_output_path, cv2.VideoWriter_fourcc(*"vp09"), fps, (width, height))
     for frame in video_frames:
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -162,7 +210,9 @@ def check_video_fps(video_path: str):
     cam = cv2.VideoCapture(video_path)
     fps = cam.get(cv2.CAP_PROP_FPS)
     if fps != 25:
-        raise ValueError(f"Video FPS is not 25, it is {fps}. Please convert the video to 25 FPS.")
+        raise ValueError(
+            f"Video FPS is not 25, it is {fps}. Please convert the video to 25 FPS."
+        )
 
 
 def one_step_sampling(ddim_scheduler, pred_noise, timesteps, x_t):
@@ -175,7 +225,9 @@ def one_step_sampling(ddim_scheduler, pred_noise, timesteps, x_t):
     if ddim_scheduler.config.prediction_type == "epsilon":
         beta_prod_t = beta_prod_t[:, None, None, None, None]
         alpha_prod_t = alpha_prod_t[:, None, None, None, None]
-        pred_original_sample = (x_t - beta_prod_t ** (0.5) * pred_noise) / alpha_prod_t ** (0.5)
+        pred_original_sample = (
+            x_t - beta_prod_t ** (0.5) * pred_noise
+        ) / alpha_prod_t ** (0.5)
     else:
         raise NotImplementedError("This prediction type is not implemented yet")
 
@@ -269,12 +321,18 @@ def count_video_time(video_path):
 
 def check_ffmpeg_installed():
     # Run the ffmpeg command with the -version argument to check if it's installed
-    result = subprocess.run("ffmpeg -version", stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    result = subprocess.run(
+        "ffmpeg -version", stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
+    )
     if not result.returncode == 0:
-        raise FileNotFoundError("ffmpeg not found, please install it by:\n    $ conda install -c conda-forge ffmpeg")
+        raise FileNotFoundError(
+            "ffmpeg not found, please install it by:\n    $ conda install -c conda-forge ffmpeg"
+        )
 
 
-def check_model_and_download(ckpt_path: str, huggingface_model_id: str = "ByteDance/LatentSync-1.5"):
+def check_model_and_download(
+    ckpt_path: str, huggingface_model_id: str = "ByteDance/LatentSync-1.5"
+):
     if not os.path.exists(ckpt_path):
         ckpt_path_obj = Path(ckpt_path)
         download_cmd = f"huggingface-cli download {huggingface_model_id} {Path(*ckpt_path_obj.parts[1:])} --local-dir {Path(ckpt_path_obj.parts[0])}"

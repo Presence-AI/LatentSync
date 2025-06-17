@@ -24,6 +24,9 @@ class Audio2Feature:
         self.embedding_dim = self.model.dims.n_audio_state
         self.audio_feat_length = audio_feat_length
 
+    def update_batch_size(self, batch_size):
+        self.num_frames = batch_size
+
     def get_sliced_feature(self, feature_array, vid_idx, fps=25):
         """
         Get sliced features based on a given index
@@ -93,7 +96,9 @@ class Audio2Feature:
 
         while True:
             start_idx = int(i * whisper_idx_multiplier)
-            selected_feature, selected_idx = self.get_sliced_feature(feature_array=feature_array, vid_idx=i, fps=fps)
+            selected_feature, selected_idx = self.get_sliced_feature(
+                feature_array=feature_array, vid_idx=i, fps=fps
+            )
             # print(f"i:{i},selected_idx {selected_idx}")
             whisper_chunks.append(selected_feature)
             i += 1
@@ -122,7 +127,8 @@ class Audio2Feature:
             return self._audio2feat(audio_path)
 
         audio_embeds_cache_path = os.path.join(
-            self.audio_embeds_cache_dir, os.path.basename(audio_path).replace(".mp4", "_embeds.pt")
+            self.audio_embeds_cache_dir,
+            os.path.basename(audio_path).replace(".mp4", "_embeds.pt"),
         )
 
         if os.path.isfile(audio_embeds_cache_path):
@@ -142,7 +148,9 @@ class Audio2Feature:
     def crop_overlap_audio_window(self, audio_feat, start_index):
         selected_feature_list = []
         for i in range(start_index, start_index + self.num_frames):
-            selected_feature, selected_idx = self.get_sliced_feature(feature_array=audio_feat, vid_idx=i, fps=25)
+            selected_feature, selected_idx = self.get_sliced_feature(
+                feature_array=audio_feat, vid_idx=i, fps=25
+            )
             selected_feature_list.append(selected_feature)
         mel_overlap = torch.stack(selected_feature_list)
         return mel_overlap
@@ -160,8 +168,12 @@ if __name__ == "__main__":
     print(f"video in {fps} FPS, audio idx in 50FPS")
     while True:
         start_idx = int(i * whisper_idx_multiplier)
-        selected_feature, selected_idx = audio_encoder.get_sliced_feature(feature_array=array, vid_idx=i, fps=fps)
-        print(f"video idx {i},\t audio idx {selected_idx},\t shape {selected_feature.shape}")
+        selected_feature, selected_idx = audio_encoder.get_sliced_feature(
+            feature_array=array, vid_idx=i, fps=fps
+        )
+        print(
+            f"video idx {i},\t audio idx {selected_idx},\t shape {selected_feature.shape}"
+        )
         i += 1
         if start_idx > len(array):
             break
