@@ -15,25 +15,18 @@
 import os
 import numpy as np
 import json
-from typing import Union
 from pathlib import Path
 import matplotlib.pyplot as plt
 import imageio
 
 import torch
 import torch.nn as nn
-import torchvision
 import torch.distributed as dist
 from torchvision import transforms
-from collections.abc import AsyncGenerator
-from concurrent.futures import ThreadPoolExecutor
-
-from einops import rearrange
 import cv2
-from decord import AudioReader, VideoReader, gpu
+from decord import AudioReader, VideoReader
 import shutil
 import subprocess
-import asyncio
 import logging
 
 logger = logging.getLogger("latentsync.utils")
@@ -108,42 +101,6 @@ def read_video_cv2(video_path: str):
     cap.release()
 
     return np.array(frames)
-
-
-async def read_video_decord_async(
-    video_path: str, batch_size: int, threadpool: ThreadPoolExecutor
-) -> AsyncGenerator[np.ndarray]:
-    """
-    Asynchronously reads video frames in batches using Decord.
-    """
-    loop = asyncio.get_event_loop()
-
-    # Initialize VideoReader
-    # TODO: add back GPU loading here with decord cuda install on latentsync
-    vr = VideoReader(video_path)
-
-    logger.info("Number of video frames: %s", len(vr))
-
-    i = 0
-    break_loop = False
-
-    def get_batch(vr, start, end):
-        batch = vr[slice(start, end)].asnumpy()
-        return batch
-
-    while True:
-        await asyncio.sleep(0)  # Yield control to the event loop
-        if i + batch_size >= len(vr):
-            break_loop = True
-            upper = len(vr)
-        else:
-            upper = i + batch_size
-
-        yield await loop.run_in_executor(threadpool, get_batch, vr, i, upper)
-        if break_loop:
-            break
-
-        i += batch_size
 
 
 def read_audio(audio_path: str, audio_sample_rate: int = 16000):
