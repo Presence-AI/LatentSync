@@ -9,6 +9,9 @@ import logging
 
 logger = logging.getLogger("AlignRestore")
 
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 
 class AlignRestore(object):
     def __init__(
