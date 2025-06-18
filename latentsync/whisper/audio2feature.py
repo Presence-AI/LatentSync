@@ -18,8 +18,8 @@ class Audio2Feature:
     ):
         self.model = load_model(model_path, device)
         self.audio_embeds_cache_dir = audio_embeds_cache_dir
-        if audio_embeds_cache_dir is not None and audio_embeds_cache_dir != "":
-            Path(audio_embeds_cache_dir).mkdir(parents=True, exist_ok=True)
+        # if audio_embeds_cache_dir is not None and audio_embeds_cache_dir != "":
+        #     Path(audio_embeds_cache_dir).mkdir(parents=True, exist_ok=True)
         self.num_frames = num_frames
         self.embedding_dim = self.model.dims.n_audio_state
         self.audio_feat_length = audio_feat_length
@@ -92,7 +92,7 @@ class Audio2Feature:
         whisper_chunks = []
         whisper_idx_multiplier = 50.0 / fps
         i = 0
-        print(f"video in {fps} FPS, audio idx in 50FPS")
+        # print(f"video in {fps} FPS, audio idx in 50FPS")
 
         while True:
             start_idx = int(i * whisper_idx_multiplier)
