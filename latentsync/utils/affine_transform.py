@@ -154,6 +154,10 @@ class AlignRestore(object):
 
     def restore_img_cv2(self, input_img, face, affine_matrix):
         h, w, _ = input_img.shape
+        if isinstance(affine_matrix, torch.Tensor):
+            affine_matrix = affine_matrix.cpu().numpy()
+            affine_matrix = affine_matrix.reshape(2, 3)
+
         inverse_affine = cv2.invertAffineTransform(affine_matrix)
         inv_restored = cv2.warpAffine(
             face, inverse_affine, (w, h), flags=cv2.INTER_LANCZOS4
