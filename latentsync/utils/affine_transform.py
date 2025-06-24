@@ -153,6 +153,7 @@ class AlignRestore(object):
             logger.error(f"Got exception on restore img: {e}")
 
     def restore_img_cv2(self, input_img, face, affine_matrix):
+        input_img = input_img.astype(np.float32) / 255.0
         h, w, _ = input_img.shape
         if isinstance(affine_matrix, torch.Tensor):
             affine_matrix = affine_matrix.cpu().numpy()
@@ -192,12 +193,10 @@ class AlignRestore(object):
 
         result_img = inv_soft_mask * pasted_face + (1 - inv_soft_mask) * input_img
 
-        if np.max(result_img) > 256:
-            result_img = result_img.astype(np.uint16)
-        else:
-            result_img = result_img.astype(np.uint8)
+        # Convert back to uint8
+        out_uint8 = (result_img * 255).clip(0, 255).astype(np.uint8)
 
-        return result_img
+        return out_uint8
 
     def transformation_from_points(
         self, points1: torch.Tensor, points0: torch.Tensor, smooth=True, p_bias=None
