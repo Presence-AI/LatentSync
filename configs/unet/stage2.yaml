@@ -8,7 +8,7 @@ data:
 
   val_video_path: assets/demo1_video.mp4
   val_audio_path: assets/demo1_audio.wav
-  batch_size: 1 # 4
+  batch_size: 16 # 4
   num_workers: 12 # 12
   num_frames: 16
   resolution: 256
